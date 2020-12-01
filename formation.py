@@ -2,6 +2,9 @@ from typing import List, Tuple
 from swarm_manager import TelloDrone, SwarmManager
 from math import radians, sin, cos
 
+# Set according to individual's wifi environment
+ROUTER_SSID_PASSWORD = "U+Net2AE6", "1C4C024328"
+
 class DroneVector(object):
     def __init__(self, x: float, y: float) -> None:
         self.x = x
@@ -90,7 +93,7 @@ class Formation(object):
         # TODO: circle drones around center
 
 if __name__ == "__main__":
-    manager = SwarmManager("U+Net2AE6", "1C4C024328")
+    manager = SwarmManager(*ROUTER_SSID_PASSWORD)
     manager.find_drones_on_network(3)
 
     formation = Formation(manager)

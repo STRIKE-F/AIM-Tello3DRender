@@ -6,12 +6,19 @@ import cv2.cv2 as cv2  # for avoidance of pylint error
 import numpy
 import time
 import datetime
+
+from swarm_manager import TelloDrone, SwarmManager
+from typing import List
+
+ROUTER_SSID_PASSWORD = "U+Net2AE6", "1C4C024328"
+
 def main():
-    drone = tellopy.Tello()
+    manager = SwarmManager(*ROUTER_SSID_PASSWORD)
+    manager.find_drones_on_network(1)
+    drones: List[TelloDrone] = manager.get_connected_drones()
+    drone = drones[0]
 
     try:
-        drone.connect()
-        drone.wait_for_connection(60.0)
         n=0
         retry = 3
         container = None
@@ -40,7 +47,7 @@ def main():
                 if cv2.waitKey(1) & 0xFF == ord('s'):
                     cv2.imwrite(now.strftime("%S.jpg"),image) # writes image test.bmp to disk
                     print("Take Picture")
-                    n=n+1;
+                    n=n+1
        
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break

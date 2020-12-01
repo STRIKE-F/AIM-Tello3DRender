@@ -1,23 +1,21 @@
-import tellopy
-
 import socket
 import time
 from threading import Thread, Lock
 from typing import List, Tuple
 import netifaces, netaddr
+from tello import APTello
+from math import atan2, degrees, sqrt
 
 # Tello's default address when in station mode is 192.168.10.1
 TELLO_DEFAULT_ADDR = ("192.168.10.1", 8889)
 # Tello uses IPv4, UDP for connection
 TELLO_SOCK_PROTOCOL = socket.AF_INET, socket.SOCK_DGRAM
 
-class TelloDrone(object):
-    def __init__(self, sock: socket.socket, serial: str, ip: str) -> None:
-        self._sock: socket.socket = sock
+class TelloDrone(APTello):
+    def __init__(self, comm_sock: socket.socket, vid_sock: socket.socket, serial: str, ip: str) -> None:
+        APTello.__init__(self, comm_sock, vid_sock, ip)
         self._serial: str = serial
-        self.ip: str = ip
         self.name: str = None
-        self._lock: Lock = Lock()
 
         self.x: float = 0
         self.y: float = 0
@@ -31,49 +29,37 @@ class TelloDrone(object):
             # only use last 4 digits of serial
             return f"Tello {self._serial[-4:]}@{self.ip}"
 
-    def takeoff(self) -> None:
-        self._send_command("takeoff", 8.0)
-
-    def land(self) -> None:
-        self._send_command("land", 8.0)
-
     # Rotate the drone by given angle
     # 0 <= abs(angle) <= 180 
     # positive angle: clockwise
     # negative angle: counterclockwise
     def rotate(self, angle: int) -> None:
         if angle > 0:
-            self._send_command(f"cw {angle}")
+            self.clockwise(angle)
         elif angle < 0:
-            self._send_command(f"ccw {angle}")
+            self.counter_clockwise(-angle)
         else:
             # no need to move when angle == 0
             pass
     
     # Move the drone by given x, y vector
+    # and align to deg = 0
     def move(self, x: float, y: float) -> None:
-        # Tello command only accepts int
-        param_x = int(x)
-        param_y = int(y)
-        self._send_command(f"go {param_x} {param_y} {0} 20")
+        # convert x, y vec to angular vec
+        # and rotate to that degrees
+        rad = atan2(-x, y)
+        angle = int(-degrees(rad))
+        self.rotate(angle)
 
-    def _threaded_send(self, comm: str) -> None:
-        try:
-            self._sock.send(comm.encode('utf-8'))
-            response = self._sock.recv(1024)
-            if response.decode('utf-8') != "ok":
-                raise ConnectionRefusedError
-        # lock MUST BE released
-        finally:
-            self._lock.release()
+        dist = int(sqrt(x**2 + y**2))
+        self.forward(dist)
 
-    def _send_command(self, comm: str, timeout: float = 2.0) -> None:
-        self._lock.acquire()
-        self._sock.settimeout(timeout)
-        # for response time, use per-drone multithreading
-        thread = Thread(self._threaded_send, args=(comm,))
-        thread.daemon = True
-        thread.start()
+        # align back to 0 degrees
+        self.rotate(-angle)
+
+        # update position info
+        self.x += x
+        self.y += y
 
     # Get abstract, relational position from control point
     def pos(self) -> Tuple[float, float, float]:
@@ -84,6 +70,10 @@ class SwarmManager(object):
         self._drones: List[TelloDrone] = []
         self._ssid: str = wifi_ssid
         self._pwd: str  = wifi_pwd
+        self._control_sock = socket.socket(*TELLO_SOCK_PROTOCOL)
+        self._video_sock = socket.socket(*TELLO_SOCK_PROTOCOL)
+        self._control_sock.bind(('', 9000))
+        self._video_sock.bind(('', 6038))
 
     # Given that this PC is connected to Tello in Station mode,
     # switch Tello to AP mode and add the drone instance once the mode's switched
@@ -95,18 +85,21 @@ class SwarmManager(object):
 
     # Find drones on AP mode and create drone instance from it
     def find_drones_on_network(self, num: int) -> None:
-        tello_socks: List[Tuple[str, socket.socket]] = self._connect_to_drones_online(num)
-        for (ip, sock) in tello_socks:
+        tello_ips: List[str] = self._find_drones_online(num)
+
+        sock = self._control_sock
+        sock.settimeout(2.0)
+
+        for ip in tello_ips:
             try:
-                sock.settimeout(3.0)
                 # get serial number
                 comm = "sn?"
-                sock.send(comm.encode('utf-8'))
-                serial = sock.recv(1024).decode('utf-8')
-                self._drones.append(TelloDrone(sock, serial, ip))
+                sock.sendto(comm.encode('utf-8'), (ip, 8889))
+                response, _ = sock.recvfrom(1024)
+                serial = response.decode('utf-8')
+                self._drones.append(TelloDrone(sock, self._video_sock, serial, ip))
             except OSError:
                 print(f"Drone at {ip} lost connection")
-                sock.close()
                 continue
                 
         print(self._drones)
@@ -114,37 +107,36 @@ class SwarmManager(object):
     def get_connected_drones(self) -> List[TelloDrone]:
         return self._drones
 
-    # Get (ip, socket)s to Tellos in network
-    def _connect_to_drones_online(self, num: int) -> List[Tuple[str, socket.socket]]:
+    # Get ips of Tellos in network
+    def _find_drones_online(self, num: int) -> List[str]:
         possible_ips = self._get_possible_ips()
         already_added_ips: List[str] = [drone.ip for drone in self._drones]
-        tello_socks: List[socket.socket] = []
+        tello_ips: List[str] = []
+        
+        sock = self._control_sock
 
         for ip in possible_ips:
             # do not try to connect if that ip is already added
             if ip in already_added_ips:
                 continue
-            # print(f"trying for {ip}")
-            sock = socket.socket(*TELLO_SOCK_PROTOCOL)
+            print(f"trying for {ip}")
             # lots of ips to scan...
-            sock.settimeout(0.2)
+            sock.settimeout(0.1)
             try:
                 # establish connection with drone
-                sock.connect((ip, 8889))
                 comm = "command"
-                sock.send(comm.encode('utf-8'))
-                response = sock.recv(1024)
+                sock.sendto(comm.encode('utf-8'), (ip, 8889))
+                response, _ = sock.recvfrom(1024)
                 if response.decode('utf-8') == "ok":
-                    tello_socks.append((ip, sock))
-                    if len(tello_socks) == num:
+                    tello_ips.append(ip)
+                    if len(tello_ips) == num:
                         break
                 else:
                     raise ConnectionRefusedError
             except OSError:
-                sock.close()
                 continue
         
-        return tello_socks
+        return tello_ips
 
     # Get entire IPs on a subnet
     def _get_possible_ips(self) -> List[str]:
@@ -181,26 +173,23 @@ class SwarmManager(object):
         sock.settimeout(5)
         
         try:
-            # establish connection to Tello
-            sock.connect(TELLO_DEFAULT_ADDR)
-
             # check connection btw/ Tello and PC
             comm = "command"
-            sock.send(comm.encode('utf-8'))
-            response = sock.recv(1024)
+            sock.sendto(comm.encode('utf-8'), TELLO_DEFAULT_ADDR)
+            response, _ = sock.recvfrom(1024)
             if response.decode('utf-8') != "ok":
                 raise ConnectionRefusedError
             
             # get serial number from Tello
             comm = "sn?"
-            sock.send(comm.encode('utf-8'))
-            response = sock.recv(1024)
+            sock.sendto(comm.encode('utf-8'), TELLO_DEFAULT_ADDR)
+            response, _ = sock.recvfrom(1024)
             serial = response.decode('utf-8')
 
             # switch the Tello mode
             comm = f"ap {self._ssid} {self._pwd}"
-            sock.send(comm.encode('utf-8'))
-            response = sock.recv(1024)
+            sock.sendto(comm.encode('utf-8'), TELLO_DEFAULT_ADDR)
+            response, _ = sock.recvfrom(1024)
             print(f"{response.decode('utf-8')} from {serial}")
 
         # timeout: failed to connect to Tello for 5 seconds
@@ -209,17 +198,3 @@ class SwarmManager(object):
 
         finally:
             sock.close()
-
-if __name__ == "__main__":
-    ctrl = SwarmManager("U+Net2AE6", "1C4C024328")
-    ctrl.find_drones_on_network(3)
-    drones: List[TelloDrone] = ctrl.get_connected_drones()
-    drones[0].takeoff()
-    time.sleep(1)
-    drones[1].takeoff()
-    time.sleep(1)
-    drones[2].takeoff()
-    time.sleep(1)
-    drones[0].land()
-    drones[1].land()
-    drones[2].land()
