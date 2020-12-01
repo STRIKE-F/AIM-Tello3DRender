@@ -2,6 +2,7 @@ import tellopy
 
 import socket
 import time
+from threading import Thread, Lock
 from typing import List, Tuple
 import netifaces, netaddr
 
@@ -9,6 +10,74 @@ import netifaces, netaddr
 TELLO_DEFAULT_ADDR = ("192.168.10.1", 8889)
 # Tello uses IPv4, UDP for connection
 TELLO_SOCK_PROTOCOL = socket.AF_INET, socket.SOCK_DGRAM
+
+class TelloDrone(object):
+    def __init__(self, sock: socket.socket, serial: str, ip: str) -> None:
+        self._sock: socket.socket = sock
+        self._serial: str = serial
+        self.ip: str = ip
+        self.name: str = None
+        self._lock: Lock = Lock()
+
+        self.x: float = 0
+        self.y: float = 0
+        self.z: float = 0
+        self.yaw: int = 0
+
+    def __repr__(self) -> str:
+        if self.name:
+            return f"Tello {self.name}@{self.ip}"
+        else:
+            # only use last 4 digits of serial
+            return f"Tello {self._serial[-4:]}@{self.ip}"
+
+    def takeoff(self) -> None:
+        self._send_command("takeoff", 8.0)
+
+    def land(self) -> None:
+        self._send_command("land", 8.0)
+
+    # Rotate the drone by given angle
+    # 0 <= abs(angle) <= 180 
+    # positive angle: clockwise
+    # negative angle: counterclockwise
+    def rotate(self, angle: int) -> None:
+        if angle > 0:
+            self._send_command(f"cw {angle}")
+        elif angle < 0:
+            self._send_command(f"ccw {angle}")
+        else:
+            # no need to move when angle == 0
+            pass
+    
+    # Move the drone by given x, y vector
+    def move(self, x: float, y: float) -> None:
+        # Tello command only accepts int
+        param_x = int(x)
+        param_y = int(y)
+        self._send_command(f"go {param_x} {param_y} {0} 20")
+
+    def _threaded_send(self, comm: str) -> None:
+        try:
+            self._sock.send(comm.encode('utf-8'))
+            response = self._sock.recv(1024)
+            if response.decode('utf-8') != "ok":
+                raise ConnectionRefusedError
+        # lock MUST BE released
+        finally:
+            self._lock.release()
+
+    def _send_command(self, comm: str, timeout: float = 2.0) -> None:
+        self._lock.acquire()
+        self._sock.settimeout(timeout)
+        # for response time, use per-drone multithreading
+        thread = Thread(self._threaded_send, args=(comm,))
+        thread.daemon = True
+        thread.start()
+
+    # Get abstract, relational position from control point
+    def pos(self) -> Tuple[float, float, float]:
+        return (self.x, self.y, self.z)
 
 class SwarmManager(object):
     def __init__(self, wifi_ssid: str, wifi_pwd: str) -> None:
@@ -29,7 +98,7 @@ class SwarmManager(object):
         tello_socks: List[Tuple[str, socket.socket]] = self._connect_to_drones_online(num)
         for (ip, sock) in tello_socks:
             try:
-                sock.settimeout(2)
+                sock.settimeout(3.0)
                 # get serial number
                 comm = "sn?"
                 sock.send(comm.encode('utf-8'))
@@ -41,6 +110,9 @@ class SwarmManager(object):
                 continue
                 
         print(self._drones)
+
+    def get_connected_drones(self) -> List[TelloDrone]:
+        return self._drones
 
     # Get (ip, socket)s to Tellos in network
     def _connect_to_drones_online(self, num: int) -> List[Tuple[str, socket.socket]]:
@@ -55,7 +127,7 @@ class SwarmManager(object):
             # print(f"trying for {ip}")
             sock = socket.socket(*TELLO_SOCK_PROTOCOL)
             # lots of ips to scan...
-            sock.settimeout(0.05)
+            sock.settimeout(0.2)
             try:
                 # establish connection with drone
                 sock.connect((ip, 8889))
@@ -138,29 +210,16 @@ class SwarmManager(object):
         finally:
             sock.close()
 
-class TelloDrone(object):
-    def __init__(self, sock: socket.socket, serial: str, ip: str) -> None:
-        self._sock: socket.socket = sock
-        self._serial: str = serial
-        self.ip: str = ip
-        self.name: str = None
-
-        self.x: float = 0.0
-        self.y: float = 0.0
-        self.z: float = 0.0
-
-    def __repr__(self) -> str:
-        if self.name:
-            return f"Tello {self.name}@{self.ip}"
-        else:
-            # only use last 4 digits of serial
-            return f"Tello {self._serial[-4:]}@{self.ip}"
-
-    # Get abstract, relational position from control point
-    def pos(self) -> Tuple[float, float, float]:
-        return (self.x, self.y, self.z)
-
 if __name__ == "__main__":
     ctrl = SwarmManager("U+Net2AE6", "1C4C024328")
-    # ctrl.add_new_drone()
     ctrl.find_drones_on_network(3)
+    drones: List[TelloDrone] = ctrl.get_connected_drones()
+    drones[0].takeoff()
+    time.sleep(1)
+    drones[1].takeoff()
+    time.sleep(1)
+    drones[2].takeoff()
+    time.sleep(1)
+    drones[0].land()
+    drones[1].land()
+    drones[2].land()
