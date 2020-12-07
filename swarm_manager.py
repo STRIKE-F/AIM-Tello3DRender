@@ -3,7 +3,6 @@ import time
 from threading import Thread, Lock
 from typing import List, Tuple
 import netifaces, netaddr
-from tello import APTello
 from math import atan2, degrees, sqrt
 
 # Tello's default address when in station mode is 192.168.10.1
@@ -21,7 +20,15 @@ class TelloDrone(object):
         self.x: float = 0
         self.y: float = 0
         self.z: float = 0
-        self.yaw: int = 0        
+        self.yaw: int = 0
+
+        self._command_queue: List[str] = []
+        self._queue_lock = Lock()
+        self._thread = Thread(target=self._command_thread)
+        self._thread.start()
+
+    def __del__(self):
+        self._thread.join()
 
     def __repr__(self) -> str:
         if self.name:
@@ -66,35 +73,55 @@ class TelloDrone(object):
     def pos(self) -> Tuple[float, float, float]:
         return (self.x, self.y, self.z)
 
+    def shutdown(self):
+        self._enqueue_command("shutdown")
+
     def takeoff(self):
-        self._send_command("takeoff")
+        self._enqueue_command("takeoff")
 
     def land(self):
-        self._send_command("land")
+        self._enqueue_command("land")
 
     def _forward(self, dist: int):
-        self._send_command(f"forward {dist}")
+        self._enqueue_command(f"forward {dist}")
 
     def _back(self, dist: int):
-        self._send_command(f"back {dist}")
+        self._enqueue_command(f"back {dist}")
 
     def _clockwise(self, angle: int):
-        self._send_command(f"cw {angle}")
+        self._enqueue_command(f"cw {angle}")
 
     def _counter_clockwise(self, angle: int):
-        self._send_command(f"ccw {angle}")
+        self._enqueue_command(f"ccw {angle}")
 
     def _up(self, dist: int):
-        self._send_command(f"up {dist}")
+        self._enqueue_command(f"up {dist}")
 
     def _down(self, dist: int):
-        self._send_command(f"down {dist}")
+        self._enqueue_command(f"down {dist}")
 
     def _send_command(self, cmd: str):
         self._sock.sendto(cmd.encode('utf-8'), (self.ip, 8889))
         response, addr = self._sock.recvfrom(1024)
         print(response.decode('utf-8'))
         print(f"response from {addr}")
+
+    def _enqueue_command(self, cmd: str):
+        self._queue_lock.acquire()
+        self._command_queue.append(cmd)
+        self._queue_lock.release()
+
+    def _command_thread(self):
+        while self._sock:
+            self._queue_lock.acquire()
+            if self._command_queue:
+                command = self._command_queue.pop(0)
+                if command == "shutdown":
+                    self._sock = None
+                else:
+                    self._send_command(command)
+            self._queue_lock.release()
+            time.sleep(0.1)
 
 class SwarmManager(object):
     def __init__(self, wifi_ssid: str, wifi_pwd: str) -> None:
