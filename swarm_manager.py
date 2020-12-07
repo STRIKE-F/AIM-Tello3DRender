@@ -11,16 +11,17 @@ TELLO_DEFAULT_ADDR = ("192.168.10.1", 8889)
 # Tello uses IPv4, UDP for connection
 TELLO_SOCK_PROTOCOL = socket.AF_INET, socket.SOCK_DGRAM
 
-class TelloDrone(APTello):
-    def __init__(self, comm_sock: socket.socket, vid_sock: socket.socket, serial: str, ip: str) -> None:
-        APTello.__init__(self, comm_sock, vid_sock, ip)
+class TelloDrone(object):
+    def __init__(self, sock: socket.socket, serial: str, ip: str) -> None:
+        self._sock = sock
         self._serial: str = serial
+        self.ip: str = ip
         self.name: str = None
 
         self.x: float = 0
         self.y: float = 0
         self.z: float = 0
-        self.yaw: int = 0
+        self.yaw: int = 0        
 
     def __repr__(self) -> str:
         if self.name:
@@ -35,9 +36,9 @@ class TelloDrone(APTello):
     # negative angle: counterclockwise
     def rotate(self, angle: int) -> None:
         if angle > 0:
-            self.clockwise(angle)
+            self._clockwise(angle)
         elif angle < 0:
-            self.counter_clockwise(-angle)
+            self._counter_clockwise(-angle)
         else:
             # no need to move when angle == 0
             pass
@@ -52,7 +53,7 @@ class TelloDrone(APTello):
         self.rotate(angle)
 
         dist = int(sqrt(x**2 + y**2))
-        self.forward(dist)
+        self._forward(dist)
 
         # align back to 0 degrees
         self.rotate(-angle)
@@ -64,6 +65,36 @@ class TelloDrone(APTello):
     # Get abstract, relational position from control point
     def pos(self) -> Tuple[float, float, float]:
         return (self.x, self.y, self.z)
+
+    def takeoff(self):
+        self._send_command("takeoff")
+
+    def land(self):
+        self._send_command("land")
+
+    def _forward(self, dist: int):
+        self._send_command(f"forward {dist}")
+
+    def _back(self, dist: int):
+        self._send_command(f"back {dist}")
+
+    def _clockwise(self, angle: int):
+        self._send_command(f"cw {angle}")
+
+    def _counter_clockwise(self, angle: int):
+        self._send_command(f"ccw {angle}")
+
+    def _up(self, dist: int):
+        self._send_command(f"up {dist}")
+
+    def _down(self, dist: int):
+        self._send_command(f"down {dist}")
+
+    def _send_command(self, cmd: str):
+        self._sock.sendto(cmd.encode('utf-8'), (self.ip, 8889))
+        response, addr = self._sock.recvfrom(1024)
+        print(response.decode('utf-8'))
+        print(f"response from {addr}")
 
 class SwarmManager(object):
     def __init__(self, wifi_ssid: str, wifi_pwd: str) -> None:
@@ -85,33 +116,24 @@ class SwarmManager(object):
 
     # Find drones on AP mode and create drone instance from it
     def find_drones_on_network(self, num: int) -> None:
-        tello_ips: List[str] = self._find_drones_online(num)
+        tellos: List[Tuple[str, str]] = self._find_drones_online(num)
+        self._control_sock.settimeout(None)
 
-        sock = self._control_sock
-        sock.settimeout(2.0)
-
-        for ip in tello_ips:
-            try:
-                # get serial number
-                comm = "sn?"
-                sock.sendto(comm.encode('utf-8'), (ip, 8889))
-                response, _ = sock.recvfrom(1024)
-                serial = response.decode('utf-8')
-                self._drones.append(TelloDrone(sock, self._video_sock, serial, ip))
-            except OSError:
-                print(f"Drone at {ip} lost connection")
-                continue
+        for (ip, serial) in tellos:
+            tello = TelloDrone(self._control_sock, serial, ip)
+            self._drones.append(tello)
                 
-        print(self._drones)
+        print(self._drones)       
+
 
     def get_connected_drones(self) -> List[TelloDrone]:
         return self._drones
 
     # Get ips of Tellos in network
-    def _find_drones_online(self, num: int) -> List[str]:
+    def _find_drones_online(self, num: int) -> List[Tuple[str, str]]:
         possible_ips = self._get_possible_ips()
         already_added_ips: List[str] = [drone.ip for drone in self._drones]
-        tello_ips: List[str] = []
+        tello_ips: List[Tuple[str, str]] = []
         
         sock = self._control_sock
 
@@ -128,7 +150,11 @@ class SwarmManager(object):
                 sock.sendto(comm.encode('utf-8'), (ip, 8889))
                 response, _ = sock.recvfrom(1024)
                 if response.decode('utf-8') == "ok":
-                    tello_ips.append(ip)
+                    comm = "sn?"
+                    sock.sendto(comm.encode('utf-8'), (ip, 8889))
+                    response, _ = sock.recvfrom(1024)
+                    serial = response.decode('utf-8')
+                    tello_ips.append((ip, serial))
                     if len(tello_ips) == num:
                         break
                 else:
