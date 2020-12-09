@@ -1,9 +1,8 @@
 import socket
 import time
 from threading import Thread, Lock
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import netifaces, netaddr
-from math import atan2, degrees, sqrt
 
 # Tello's default address when in station mode is 192.168.10.1
 TELLO_DEFAULT_ADDR = ("192.168.10.1", 8889)
@@ -11,7 +10,8 @@ TELLO_DEFAULT_ADDR = ("192.168.10.1", 8889)
 TELLO_SOCK_PROTOCOL = socket.AF_INET, socket.SOCK_DGRAM
 
 class TelloDrone(object):
-    def __init__(self, sock: socket.socket, serial: str, ip: str) -> None:
+    # manager: TelloDrone
+    def __init__(self, sock: socket.socket, serial: str, ip: str, manager) -> None:
         self._sock = sock
         self._serial: str = serial
         self.ip: str = ip
@@ -26,6 +26,8 @@ class TelloDrone(object):
         self._queue_lock = Lock()
         self._thread = Thread(target=self._command_thread)
         self._thread.start()
+
+        self._manager = manager
 
     def __del__(self):
         self._thread.join()
@@ -49,32 +51,24 @@ class TelloDrone(object):
         else:
             # no need to move when angle == 0
             pass
-    
-    # Move the drone by given x, y vector
-    # and align to deg = 0
-    def move(self, x: float, y: float) -> None:
-        # convert x, y vec to angular vec
-        # and rotate to that degrees
-        rad = atan2(-x, y)
-        angle = int(-degrees(rad))
-        self.rotate(angle)
-
-        dist = int(sqrt(x**2 + y**2))
-        self._forward(dist)
-
-        # align back to 0 degrees
-        self.rotate(-angle)
-
-        # update position info
+        
+    def move(self, x: int, y: int, z: int = 0, speed: int = 30):
+        self._enqueue_command(f"go {y} {-x} {z} {speed}")
         self.x += x
         self.y += y
+        self.z += z
 
     # Get abstract, relational position from control point
     def pos(self) -> Tuple[float, float, float]:
         return (self.x, self.y, self.z)
 
+    # Terminate connection between Drone and PC
     def shutdown(self):
         self._enqueue_command("shutdown")
+
+    # Wait for certain signal to be sent from user code
+    def wait_for(self, signal: str):
+        self._enqueue_command(f"wait {signal}")
 
     def takeoff(self):
         self._enqueue_command("takeoff")
@@ -87,6 +81,9 @@ class TelloDrone(object):
 
     def _back(self, dist: int):
         self._enqueue_command(f"back {dist}")
+
+    def _speed(self, speed: int):
+        self._enqueue_command(f"speed {speed}")
 
     def _clockwise(self, angle: int):
         self._enqueue_command(f"cw {angle}")
@@ -103,8 +100,7 @@ class TelloDrone(object):
     def _send_command(self, cmd: str):
         self._sock.sendto(cmd.encode('utf-8'), (self.ip, 8889))
         response, addr = self._sock.recvfrom(1024)
-        print(response.decode('utf-8'))
-        print(f"response from {addr}")
+        print(f"response from {addr}: {response.decode('utf-8')}")
 
     def _enqueue_command(self, cmd: str):
         self._queue_lock.acquire()
@@ -118,6 +114,13 @@ class TelloDrone(object):
                 command = self._command_queue.pop(0)
                 if command == "shutdown":
                     self._sock = None
+                elif "wait" in command:
+                    signal = command.split(maxsplit=1)[1]
+                    # inserting same command into the front forms a 'waiting loop'
+                    # loop until _wait_for_signal() returns False, which means
+                    # the signal has been sent to manager
+                    if self._manager._wait_for_signal(signal):
+                        self._command_queue.insert(0, command)
                 else:
                     self._send_command(command)
             self._queue_lock.release()
@@ -132,6 +135,8 @@ class SwarmManager(object):
         self._video_sock = socket.socket(*TELLO_SOCK_PROTOCOL)
         self._control_sock.bind(('', 9000))
         self._video_sock.bind(('', 6038))
+        self._signals = {}
+        self._signals_lock = Lock()
 
     # Given that this PC is connected to Tello in Station mode,
     # switch Tello to AP mode and add the drone instance once the mode's switched
@@ -147,7 +152,7 @@ class SwarmManager(object):
         self._control_sock.settimeout(None)
 
         for (ip, serial) in tellos:
-            tello = TelloDrone(self._control_sock, serial, ip)
+            tello = TelloDrone(self._control_sock, serial, ip, self)
             self._drones.append(tello)
                 
         print(self._drones)       
@@ -251,3 +256,28 @@ class SwarmManager(object):
 
         finally:
             sock.close()
+
+    # Only to be used from TelloDrone
+    # Returns True if this signal hasn't been sent from outside
+    # Returns False if this signal has been sent from outside
+    # and therefore Tellos should stop waiting
+    def _wait_for_signal(self, signal: str) -> bool:
+        with self._signals_lock:
+            if signal in self._signals:
+                signal_status: Optional[str] = self._signals[signal]
+                if not signal_status:
+                    return False
+                else:
+                    return True
+            else:
+                self._signals[signal] = "waiting"
+                return True
+
+    # Sends a signal to all Tellos in network
+    # Will immediately terminate all waits on that signal
+    # and Tellos that asks for this signal after the method call
+    # will not wait and will immediately execute the next command on queue
+    def send_signal(self, signal: str) -> None:
+        with self._signals_lock:
+            self._signals[signal] = None
+
