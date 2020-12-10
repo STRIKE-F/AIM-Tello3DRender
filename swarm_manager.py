@@ -66,10 +66,6 @@ class TelloDrone(object):
     def shutdown(self):
         self._enqueue_command("shutdown")
 
-    # Wait for certain signal to be sent from user code
-    def wait_for(self, signal: str):
-        self._enqueue_command(f"wait {signal}")
-
     def takeoff(self):
         self._enqueue_command("takeoff")
 
@@ -103,9 +99,15 @@ class TelloDrone(object):
         print(f"response from {addr}: {response.decode('utf-8')}")
 
     def _enqueue_command(self, cmd: str):
-        self._queue_lock.acquire()
-        self._command_queue.append(cmd)
-        self._queue_lock.release()
+        with self._queue_lock:
+            self._command_queue.append(cmd)
+
+    def _is_complete(self) -> bool:
+        with self._queue_lock:
+            if self._command_queue:
+                return False
+            else:
+                return True
 
     def _command_thread(self):
         while self._sock:
@@ -114,13 +116,6 @@ class TelloDrone(object):
                 command = self._command_queue.pop(0)
                 if command == "shutdown":
                     self._sock = None
-                elif "wait" in command:
-                    signal = command.split(maxsplit=1)[1]
-                    # inserting same command into the front forms a 'waiting loop'
-                    # loop until _wait_for_signal() returns False, which means
-                    # the signal has been sent to manager
-                    if self._manager._wait_for_signal(signal):
-                        self._command_queue.insert(0, command)
                 else:
                     self._send_command(command)
             self._queue_lock.release()
@@ -257,27 +252,13 @@ class SwarmManager(object):
         finally:
             sock.close()
 
-    # Only to be used from TelloDrone
-    # Returns True if this signal hasn't been sent from outside
-    # Returns False if this signal has been sent from outside
-    # and therefore Tellos should stop waiting
-    def _wait_for_signal(self, signal: str) -> bool:
-        with self._signals_lock:
-            if signal in self._signals:
-                signal_status: Optional[str] = self._signals[signal]
-                if not signal_status:
-                    return False
-                else:
-                    return True
-            else:
-                self._signals[signal] = "waiting"
-                return True
-
-    # Sends a signal to all Tellos in network
-    # Will immediately terminate all waits on that signal
-    # and Tellos that asks for this signal after the method call
-    # will not wait and will immediately execute the next command on queue
-    def send_signal(self, signal: str) -> None:
-        with self._signals_lock:
-            self._signals[signal] = None
+    def sync(self):
+        wait = True
+        while wait:
+            wait = False
+            for drone in self._drones:
+                if not drone._is_complete():
+                    wait = True
+                    break
+            time.sleep(0.1)
 
